@@ -1,0 +1,490 @@
+---
+title: "B cells"
+output:
+    html_document:
+      toc: true
+      number_sections: true
+date: "2024-04-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Code to reproduce results of section 5 of paper "Conformal inference for cell type annotation with graph-structured constraints"
+
+```{r, message=FALSE}
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(VGAM)
+library(igraph)
+library(ontoProc)
+library(scConform)
+library(BiocParallel)
+```
+
+
+```{r, message=FALSE}
+`%notin%` = Negate(`%in%`)
+
+cl <- getOnto("cellOnto", "2023")
+```
+
+# Load data
+
+```{r}
+sce_Covid_Bcells <- readRDS("sce_Covid_Bcells.rds")
+#colnames(colData(sce_Covid_Bcells))
+length(table(sce_Covid_Bcells$donor_id))
+```
+
+# Choose samples and build training/test dataset
+```{r}
+table(sce_Covid_Bcells$Site)
+B_Ncl <- sce_Covid_Bcells[,sce_Covid_Bcells$Site=='Ncl']
+barplot(prop.table(table(B_Ncl$cell_type_curated)))
+```
+
+```{r}
+table(B_Ncl$cell_type_curated)
+table(B_Ncl$disease)
+table(B_Ncl$Status)
+```
+
+
+
+
+```{r}
+test <- sce_Covid_Bcells[,sce_Covid_Bcells$donor_id=="MH9143273" & 
+                           sce_Covid_Bcells$cell_type_curated!="B cell"]
+other <- sce_Covid_Bcells[,sce_Covid_Bcells$donor_id!="MH9143273"& 
+                           sce_Covid_Bcells$cell_type_curated!="B cell" &
+                            sce_Covid_Bcells$Site=="Ncl" &
+                            sce_Covid_Bcells$disease=="COVID-19"]
+
+barplot(rbind(prop.table(table(other$cell_type_curated)),
+              prop.table(table(test$cell_type_curated))), 
+              beside=TRUE,
+        legend=c("test", "train"))
+length(unique(other$donor_id))
+other
+test
+```
+
+# Preprocess datasets
+
+```{r}
+# Add quality control metrics and filter low-quality cells
+hist(other$detected, nclass = 50) # number of different features
+abline(v = quantile(other$detected, probs = 0.05), col = 2)
+# delete cells with less than 0.05 quantile of expressed features
+low_detection <- (other$detected < quantile(other$detected, probs = 0.05)) 
+
+hist(other$sum, nclass = 50) # total number of counts
+abline(v = quantile(other$sum, probs = c(0.95)), col = 2) # quantile 0.95
+# delete cells with more than quantile(other$sum, probs = c(0.95)) total counts, might be doublets
+high_counts <- other$sum > quantile(other$sum, probs = c(0.95))
+
+other <- other[, !low_detection & !high_counts]
+other #32431 
+```
+
+```{r}
+hist(test$detected, nclass = 50) # number of different features
+abline(v = quantile(test$detected, probs = 0.05), col = 2)
+# delete cells with less than 0.05 quantile of expressed features
+low_detection <- (test$detected < quantile(test$detected, probs = 0.05)) 
+
+hist(test$sum, nclass = 50) # total number of counts
+abline(v = quantile(test$sum, probs = c(0.95)), col = 2) # quantile 0.95
+# delete cells with more than quantile(test$sum, probs = c(0.95)) total counts, might be doublets
+high_counts <- test$sum > quantile(test$sum, probs = c(0.95))
+
+test <- test[, !low_detection & !high_counts]
+test #1762
+```
+
+# Build ontology
+
+```{r}
+tags <- unique(other$cell_type_ontology_term_id)
+p <- onto_plot2(cl, tags)
+
+onto <- graph_from_graphnel(p)
+
+## Delete instances from other ontologies
+sel_ver <- V(onto)$name[c(grep("CARO", V(onto)$name), grep("BFO", V(onto)$name))]
+onto <- onto - sel_ver
+
+## Rename vertex to match annotations
+V(onto)$name[V(onto)$name=="IgA\nplasma cell\nCL:0000987"] <- "IgA plasma cell"
+V(onto)$name[V(onto)$name=="IgM\nplasma cell\nCL:0000986"] <- "IgM plasma cell"
+V(onto)$name[V(onto)$name=="naive\nB cell\nCL:0000788"] <- "naive B cell"
+V(onto)$name[V(onto)$name=="immature\nB cell\nCL:0000816"] <- "immature B cell"
+V(onto)$name[V(onto)$name=="class\nswitched memory B cell\nCL:0000972"] <- "class switched memory B cell"
+V(onto)$name[V(onto)$name=="unswitched\nmemory B cell\nCL:0000970"] <- "unswitched memory B cell"
+V(onto)$name[V(onto)$name=="IgG\nplasma cell\nCL:0000985"] <- "IgG plasma cell"
+V(onto)$name[V(onto)$name=="plasmablast\nCL:0000980"] <- "plasmablast"
+
+
+pan.gr <- as_graphnel(onto)
+plot(pan.gr, attrs=list(node=list(fontsize=27, shape="box")))
+V(onto)$name <- gsub("\n", " ", V(onto)$name)
+V(onto)$name <- sub("CL:.*", "", V(onto)$name)
+
+pan.gr1 <- as_graphnel(onto)
+plot(pan.gr1, attrs=list(node=list(fontsize=27, shape="box")))
+```
+
+# Uncertainty quantification
+
+Build a balanced train+cal dataset by downsampling the dataset "other"
+```{r}
+num <- min(table(other$cell_type_curated))
+cl.types <- unique(other$cell_type_curated)
+set.seed(1130)
+idx <- NULL
+for(i in cl.types){
+  cat <- which(other$cell_type_curated==i)
+  idx_cat <- sample(cat, size = num, replace = FALSE)
+  idx <- c(idx, idx_cat)
+}
+other
+
+other.bal <- other[,idx]
+barplot(prop.table(table(other$cell_type_curated)))
+barplot(prop.table(table(other.bal$cell_type_curated)))
+```
+
+Fit model
+
+```{r, warning=FALSE}
+other.bal <- logNormCounts(other.bal)
+test <- logNormCounts(test)
+v <- modelGeneVar(other.bal)
+hvg <- getTopHVGs(v, n=50)
+
+# Extract counts and construct df 
+df <- as.data.frame(t(as.matrix(logcounts(other.bal[hvg,])))) 
+df$Y <- other.bal$cell_type_curated
+
+set.seed(1312)
+
+cal <- sample(1:nrow(df), 1000)
+df.train <- df[-cal,]
+df.cal <- df[cal,]
+table(df.train$Y)
+fit.bal <- vglm(Y ~ ., family = multinomial(refLevel = "naive B cell"),
+                data = df.train)
+
+# See performance on test data
+df.test <- as.data.frame(t(as.matrix(logcounts(test[hvg,]))))
+df.test$Y <- test$cell_type_curated
+pr <- predict(fit.bal, newdata=df.test, type="response")
+pr.class <- apply(pr, 1, function(row) colnames(pr)[which.max(row)])
+mean(pr.class==df.test$Y) #0.51
+# round(prop.table(table(pr.class, df.test$Y), margin = 2),3)
+pheatmap::pheatmap(prop.table(table(pr.class, df.test$Y), margin = 2),cluster_rows = F, cluster_cols = F)
+
+#Bad. Performance on data from the same donos?
+pr.cal <- predict(fit.bal, newdata=df.cal, type="response")
+pr.class.cal <- apply(pr.cal, 1, function(row) colnames(pr.cal)[which.max(row)])
+mean(pr.class.cal==df.cal$Y) #0.55
+# round(prop.table(table(pr.class, df.cal$Y), margin = 2),3)
+pheatmap::pheatmap(prop.table(table(pr.class.cal, df.cal$Y), margin = 2),cluster_rows = F, cluster_cols = F)
+
+```
+
+Compare true distribution of Y with fitted distribution
+
+```{r}
+barplot(rbind(prop.table(table(pr.class)), prop.table(table(df.test$Y))), beside=T,
+        legend.text=c("Pred", "True"), main="Test")
+barplot(rbind(prop.table(table(pr.class.cal)), prop.table(table(df.cal$Y))), beside=T,
+        legend.text=c("Pred", "True"), main="Calibration")
+
+prop.table(table(pr.class))
+prop.table(table(df.test$Y))
+```
+
+## Conformal inference
+
+Compare coverage with and without resampling correction
+```{r}
+labels <- V(onto)$name[degree(onto, mode = "out") == 0]
+spe_cal <- other.bal[,cal]
+# Create corresponding colData
+for (i in labels) {
+    colData(spe_cal)[[i]] <- pr.cal[, i]
+    colData(test)[[i]] <- pr[, i]
+}
+
+test <- getPredictionSets(x_query=test, x_cal=spe_cal, 
+                          y_cal=spe_cal$cell_type_curated,
+                          alpha=0.1, follow_ontology = FALSE, resample=FALSE,
+                          onto=onto, pr_name = "pr_conf_nores")
+
+mean(mapply(`%in%`, test$cell_type_curated, test$pr_conf_nores))
+# 0.948
+
+test <- getPredictionSets(x_query=test, x_cal=spe_cal, 
+                          y_cal=spe_cal$cell_type_curated,
+                          alpha=0.1, follow_ontology = TRUE, resample=FALSE,
+                          onto=onto, pr_name = "pr_crc_nores",
+                          BPPARAM = MulticoreParam(workers = 8))
+mean(mapply(`%in%`, test$cell_type_curated, test$pr_crc_nores))
+# 0.9659478
+
+set.seed(1600)
+test <- getPredictionSets(x_query=test, x_cal=spe_cal, 
+                          y_cal=spe_cal$cell_type_curated,
+                          alpha=0.1, follow_ontology = FALSE, resample=TRUE,
+                          onto=onto, pr_name = "pr_conf_res")
+
+mean(mapply(`%in%`, test$cell_type_curated, test$pr_conf_res))
+# 0.930
+
+test <- getPredictionSets(x_query=test, x_cal=spe_cal, 
+                          y_cal=spe_cal$cell_type_curated,
+                          alpha=0.1, follow_ontology = TRUE, resample=TRUE,
+                          onto=onto, pr_name = "pr_crc_res",
+                          BPPARAM = MulticoreParam(workers = 8))
+mean(mapply(`%in%`, test$cell_type_curated, test$pr_crc_res))
+# 0.915
+```
+
+Compare results with an estimated oracle correction that resamples based on the real values of the proportions in the test set
+```{r}
+resample.oracle <- function(cal, test, cal.pred, seed = NA) {
+  if (!is.na(seed)) set.seed(seed)
+  
+  cal_freq <- prop.table(table(cal$Y))
+  test_freq <- prop.table(table(test$Y))
+  des_freq <- round(test_freq * length(cal$Y))
+  
+  idx <- NULL
+  for (i in unique(test$Y)) {
+    cat <- which(cal$Y == i)
+    if (!is.na(des_freq[i])) {
+      idx_cat <- sample(cat, size = des_freq[i], replace = TRUE)
+      idx <- c(idx, idx_cat)
+    }
+  }
+  
+  return(list(cal = cal[idx, ], p.cal = cal.pred[idx, ]))
+}
+
+cal_oracle <- resample.oracle(df.cal, df.test, pr.cal, seed=1)
+
+oracle_sets <- getPredictionSets(x_query=pr, x_cal=cal_oracle$p.cal, 
+                          y_cal=cal_oracle$cal$Y,
+                          alpha=0.1, follow_ontology = FALSE, resample=FALSE,
+                          return_sc=FALSE, onto=onto)
+mean(mapply(`%in%`, test$cell_type_curated, oracle_sets))
+#0.918
+oracle_sets_gr <- getPredictionSets(x_query=pr, x_cal=cal_oracle$p.cal, 
+                          y_cal=cal_oracle$cal$Y,
+                          alpha=0.1, follow_ontology = TRUE, resample=FALSE,
+                          onto=onto, return_sc=FALSE,
+                          BPPARAM = MulticoreParam(workers = 6))
+
+mean(mapply(`%in%`, test$cell_type_curated, oracle_sets_gr))
+#0.896
+```
+
+
+## Visualization
+
+```{r}
+test$comm_anc <- vapply(
+            test$pr_crc_res,
+            function(x) scConform::getCommonAncestor(x, onto),
+            character(1)
+        )
+
+## Check 
+ch <- rep(NA, length(test$comm_anc))
+for(i in seq_along(test$comm_anc))
+  ch[i] <- length(scConform:::.children(test$comm_anc[[i]], onto)) == length(test$pr_crc_res[[i]])
+sum(!ch)
+
+test$comm_anc1 <- vapply(
+            test$pr_crc_res,
+            function(x) getCommonAncestor(x, onto),
+            character(1)
+        )
+ch1 <- rep(NA, length(test$comm_anc1))
+for(i in seq_along(test$comm_anc1))
+  ch1[i] <- length(scConform:::.children(test$comm_anc1[[i]], onto)) == length(test$pr_crc_res[[i]])
+sum(!ch1)
+
+j <- mapply(function(x, y) identical(x, y), test$comm_anc, test$comm_anc1)
+sum(!j)
+test$pr_crc_res[!ch]
+special_set <- c("IgA plasma cell", "IgM plasma cell", "IgG plasma cell",
+                 "plasmablast", "naive B cell", "class switched memory B cell",
+                 "unswitched memory B cell")
+for (i in seq_along(test$pr_crc_res)) {
+  if (identical(test$pr_crc_res[[i]], special_set)) {
+    test$comm_anc1[i] <- "antibody secreting cell, mature B cell"
+  }
+}
+```
+
+```{r}
+# Define the color vector
+color_vector <- c(
+  "IgA plasma cell" = "#1f77b4",              # Blue
+  "mature B cell " = "#ff7f0e",               # Orange
+  "long lived plasma cell " = "#2ca02c",      # Green
+  "B cell, CD19-positive " = "#d62728",       # Red
+  "memory B cell " = "#9467bd",               # Purple
+  "IgM plasma cell" = "#8c564b",              # Brown
+  "class switched memory B cell" = "#e377c2", # Pink
+  "plasmablast" = "#7f7f7f",                  # Gray
+  "lymphocyte of B lineage " = "#bcbd22",     # Olive
+  "antibody secreting cell " = "#17becf",     # Cyan
+  "unswitched memory B cell" = "#f7b6d2",     # Light Pink
+  "immature B cell" = "#c5b0d5",              # Light Purple
+  "antibody secreting cell, mature B cell" = "#ff9896", # Light Red
+  "IgG plasma cell" = "gold",             # Light Blue
+  "naive B cell" = "#1ABC9C"                  # Light Gray
+)
+
+# Add point predictions
+test$pr_label <- pr.class
+
+test <- runPCA(test, name="PCA1")
+set.seed(1)
+test <- runTSNE(test, dimred="PCA")
+
+plotTSNE(test, color_by = "cell_type_curated") +
+    scale_color_manual(values = color_vector) +
+    labs(color = "Point predictions")
+plotTSNE(test, color_by = "pr_label") +
+    scale_color_manual(values = color_vector) +
+    labs(color = "Point predictions")
+plotTSNE(test, color_by = "comm_anc1") +
+    scale_color_manual(values = color_vector) +
+    labs(color = "Graph-based labels")
+
+
+
+```
+
+# More simulations
+
+```{r}
+sims.res2 <- function(B=10, seed=1309, train.data=df.c, test.data=df.test, 
+                      alpha=0.1, onto, lambda=seq(0.001,0.999,length.out=100)){
+  set.seed(seed)
+  covs.true <- covs.or <- covs.res <- rep(NA, B)
+  covs.true.crc <- covs.or.crc <- covs.res.crc <- rep(NA, B)
+  for(i in 1:B){
+    cal <- sample(1:nrow(train.data), 1000)
+    df.train <- train.data[-cal,]
+    df.cal <- train.data[cal,]
+    fit <- vglm(Y ~ ., family = multinomial(refLevel = "naive B cell"),
+                    data = df.train)
+    pr.test <- predict(fit, newdata=test.data, type="response")
+    pr.cal <- predict(fit, newdata=df.cal, type="response")
+    # True
+    true_conf <- getPredictionSets(pr.test, pr.cal, df.cal$Y, onto, alpha, 
+                                   follow_ontology = FALSE, resample = FALSE,
+                                   return_sc = FALSE)
+    true_graph <- getPredictionSets(pr.test, pr.cal, df.cal$Y, onto, alpha, 
+                                   follow_ontology = TRUE, resample = FALSE,
+                                   return_sc = FALSE,
+                                   BPPARAM = MulticoreParam(workers = 6))
+    covs.true[i] <- mean(mapply(`%in%`, test.data$Y, true_conf))
+    covs.true.crc[i] <- mean(mapply(`%in%`, test.data$Y, true_graph))
+    
+    # Oracle
+    cal_oracle <- resample.oracle(df.cal, test.data, pr.cal, seed=1)
+
+    oracle_sets <- getPredictionSets(x_query=pr.test, x_cal=cal_oracle$p.cal, 
+                              y_cal=cal_oracle$cal$Y,
+                              alpha=0.1, follow_ontology = FALSE, resample=FALSE,
+                              return_sc=FALSE, onto=onto)
+    covs.or[i] <- mean(mapply(`%in%`, test.data$Y, oracle_sets))
+
+    oracle_sets_gr <- getPredictionSets(x_query=pr.test, x_cal=cal_oracle$p.cal, 
+                              y_cal=cal_oracle$cal$Y,
+                              alpha=0.1, follow_ontology = TRUE, resample=FALSE,
+                              onto=onto, return_sc=FALSE,
+                              BPPARAM = MulticoreParam(workers = 6))
+    
+    covs.or.crc[i] <- mean(mapply(`%in%`, test.data$Y, oracle_sets_gr))
+    
+    # Estimated resample
+    res_sets <- getPredictionSets(pr.test, pr.cal, df.cal$Y, onto, alpha, 
+                                  follow_ontology = FALSE, resample = TRUE,
+                                  return_sc = FALSE)
+
+    covs.res[i] <- mean(mapply(`%in%`, test.data$Y, res_sets))
+
+    res_sets_gr <- getPredictionSets(pr.test, pr.cal, df.cal$Y, onto, alpha, 
+                                   follow_ontology = TRUE, resample = TRUE,
+                                   return_sc = FALSE,
+                                   BPPARAM = MulticoreParam(workers = 6))
+    covs.res.crc[i] <- mean(mapply(`%in%`, test.data$Y, res_sets_gr))
+    
+    cat(i)
+  }
+  return(list(covs.true=covs.true, covs.or=covs.or, covs.res=covs.res,
+              covs.true.crc=covs.true.crc, covs.or.crc=covs.or.crc, 
+              covs.res.crc=covs.res.crc))
+}
+```
+
+
+```{r, warning=FALSE}
+res.crc <- sims.res2(B=100, seed=1331, train.data=df, test.data=df.test, 
+                     alpha = 0.1, onto=onto)
+
+lapply(res.crc, mean)
+lapply(res.crc, function(x) sd(x)/sqrt(100))
+```
+
+
+
+```{r}
+par(mfrow=c(2,2))
+hist(res.crc$covs.true, prob=T, main="Histogram of coverage, no Y correction")
+n <- nrow(df.cal)
+alpha <- 0.1
+a <- n + 1 - floor((n + 1) * alpha)
+b <- floor((n + 1) * alpha)
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.true), lty=3, col=2)
+hist(res.crc$covs.or, prob=T,  main="Histogram of coverage, oracle correction")
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.or), lty=3, col=2)
+hist(res.crc$covs.res, prob=T,  main="Histogram of coverage, estimated freq correction")
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.res), lty=3, col=2)
+```
+
+```{r}
+par(mfrow=c(2,2))
+hist(res.crc$covs.true.crc, prob=T, main="Histogram of coverage, no Y correction")
+
+alpha <- 0.1
+
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.true.crc), lty=3, col=2)
+hist(res.crc$covs.or.crc, prob=T,  main="Histogram of coverage, oracle correction")
+
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.or.crc), lty=3, col=2)
+hist(res.crc$covs.res.crc, prob=T,  main="Histogram of coverage, estimated freq correction")
+
+abline(v=1-alpha, lty=2)
+abline(v=mean(res.crc$covs.res.crc), lty=3, col=2)
+```
+

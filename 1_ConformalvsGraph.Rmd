@@ -1,0 +1,252 @@
+---
+title: Hierarchical Conformal Prediction with an application to MERFISH mouse ileum
+  data
+author: "Daniela Corbetta"
+date: "2024-06-27"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Code to reproduce analysis in section 4 of the paper "Conformal inference for cell type annotation with graph-structured constraints"
+
+# Load libraries and utility
+
+```{r, message=FALSE}
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(VGAM)
+library(igraph)
+library(ontoProc)
+library(MerfishData)
+library(ExperimentHub)
+library(kableExtra)
+library(scConform)
+`%notin%` = Negate(`%in%`)
+```
+
+
+# Load data and build ontology
+
+Load data and build ontology (for later)
+
+```{r}
+# Load data
+spe_baysor <- MouseIleumPetukhov2021(
+    segmentation = "baysor",
+    use.images = FALSE, use.polygons = FALSE
+)
+# Load ontology
+cl <- getOnto("cellOnto", "2023")
+
+tags <- c(
+    "CL:0009022", # Stromal
+    "CL:0000236", # B cell
+    "CL:0009080", # Tuft
+    "CL:1000411", # Endothelial
+    "CL:1000335", # Enterocyte
+    "CL:1000326", # Goblet
+    "CL:0002088", # ICC
+    "CL:0009007", # Macrophage + DC
+    "CL:1000343", # Paneth
+    "CL:0000669", # Pericyte
+    "CL:1000278", # Smooth Muscle
+    "CL:0009017", # Stem + TA
+    "CL:0000492", # T (CD4+)
+    "CL:0000625", # T (CD8+)
+    "CL:0017004" # Telocyte
+)
+opi <- graph_from_graphnel(onto_plot2(cl, tags))
+
+## Delete instances from other ontologies
+sel_ver <- V(opi)$name[c(grep("CARO", V(opi)$name), grep("BFO", V(opi)$name))]
+opi1 <- opi - sel_ver
+
+## Rename vertex to match annotations
+V(opi1)$name[grep("CL:0000236", V(opi1)$name)] <- "B cell"
+V(opi1)$name[grep("CL:1000411", V(opi1)$name)] <- "Endothelial"
+V(opi1)$name[grep("CL:1000335", V(opi1)$name)] <- "Enterocyte"
+V(opi1)$name[grep("CL:1000326", V(opi1)$name)] <- "Goblet"
+V(opi1)$name[grep("CL:0002088", V(opi1)$name)] <- "ICC"
+V(opi1)$name[grep("CL:0009007", V(opi1)$name)] <- "Macrophage + DC"
+V(opi1)$name[grep("CL:1000343", V(opi1)$name)] <- "Paneth"
+V(opi1)$name[grep("CL:0000669", V(opi1)$name)] <- "Pericyte"
+V(opi1)$name[grep("CL:1000278", V(opi1)$name)] <- "Smooth Muscle"
+V(opi1)$name[grep("CL:0009017", V(opi1)$name)] <- "Stem + TA"
+V(opi1)$name[grep("CL:0009022", V(opi1)$name)] <- "Stromal"
+V(opi1)$name[grep("CL:0000492", V(opi1)$name)] <- "T (CD4+)"
+V(opi1)$name[grep("CL:0000625", V(opi1)$name)] <- "T (CD8+)"
+V(opi1)$name[grep("CL:0017004", V(opi1)$name)] <- "Telocyte"
+V(opi1)$name[grep("CL:0009080", V(opi1)$name)] <- "Tuft"
+
+## Add the edge from connective tissue cell and telocyte and delete redundant
+## nodes
+opi1 <- add_edges(opi1, c("connective\ntissue cell\nCL:0002320", "Telocyte"))
+gr <- as_graphnel(opi1)
+opi2 <- opi1 - c(
+    "somatic\ncell\nCL:0002371", "contractile\ncell\nCL:0000183",
+    "native\ncell\nCL:0000003"
+)
+
+V(opi2)$name <- trimws(gsub("CL:.*|\\n", " ", V(opi2)$name))
+
+gr1 <- as_graphnel(opi2)
+
+## Plot the final ontology
+attrs <- list(node = list(shape = "box", fontsize = 15, fixedsize = FALSE))
+plot(gr1, attrs = attrs)
+```
+
+Preprocess data:
+```{r}
+spe_baysor$cell_type <- spe_baysor$leiden_final
+spe_baysor$cell_type[spe_baysor$cell_type %in% c(
+    "B (Follicular, Circulating)",
+    "B (Plasma)"
+)] <- "B cell"
+spe_baysor$cell_type[grep("Enterocyte", spe_baysor$cell_type)] <- "Enterocyte"
+spe_baysor <- spe_baysor[, spe_baysor$cell_type %notin% c(
+    "Removed",
+    "Myenteric Plexus"
+)]
+spe_baysor
+
+# See frequencies of cell types
+table(spe_baysor$cell_type)
+```
+
+
+## Fit a classification model
+- Randomly select 500 cells for train dataset
+- Fit logit multinomial model on the train dataset
+- Split the remaining cells into calibration (1000 cells) and test. See performance of the model on the test dataset
+
+```{r model, warning=FALSE}
+# Randomly select 500 cells
+set.seed(1703)
+train <- sample(1:ncol(spe_baysor), 500)
+
+# Training data
+spe_train <- spe_baysor[, train]
+spe_train
+spe_other <- spe_baysor[, -train]
+
+# get HVGs
+spe_train <- logNormCounts(spe_train)
+v <- modelGeneVar(spe_train)
+hvg <- getTopHVGs(v, n = 50)
+
+# Extract counts and convert data into a data.frame format
+df_train <- as.data.frame(t(as.matrix(counts(spe_train[hvg, ]))))
+df_other <- as.data.frame(t(as.matrix(counts(spe_other[hvg, ]))))
+df_train$Y <- spe_train$cell_type
+df_other$Y <- spe_other$cell_type
+table(df_train$Y)
+
+# Fit multinomial model
+fit <- vglm(Y ~ .,
+    family = multinomial(refLevel = "B cell"),
+    data = df_train
+)
+
+# split data
+set.seed(1237)
+cal <- sample(1:nrow(df_other), 1000)
+df_cal <- df_other[cal,]
+df_test <- df_other[-cal,]
+
+# See performance on the test data
+p_test <- predict(fit, newdata=df_test, type="response")
+pr_class <- apply(p_test, 1, function(row) colnames(p_test)[which.max(row)])
+mean(pr_class==df_test$Y)
+```
+
+# Compare standard conformal inference with conformal risk control
+
+Obtain prediction sets with standard conformal inference and the graph-based method.
+
+```{r}
+p_cal <- predict(fit, newdata=df_cal, type="response")
+# Conformal inference
+sets_cf <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = FALSE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+# Check coverage
+(cvg_cf <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_cf)))
+
+# Graph-based
+sets_graphs <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+# Check coverage
+(cvg_graphs <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs)))
+```
+
+
+## Comparison of sizes of prediction sets
+
+```{r}
+sizes_std <- sapply(sets_cf, length)
+sizes_gr <- sapply(sets_graphs, length)
+sizes_std_df <- as.data.frame(table(sizes_std))
+sizes_gr_df <- as.data.frame(table(sizes_gr))
+names(sizes_std_df) <- c("size", "Standard")
+names(sizes_gr_df) <- c("size", "Graphs")
+merged <- merge(sizes_std_df, sizes_gr_df, by='size', all.x = TRUE, all.y=TRUE)
+
+merged$Graphs[is.na(merged$Graphs)] <- 0
+merged$Standard[is.na(merged$Standard)] <- 0
+
+obj <- t(as.matrix(merged[,2:3]))
+colnames(obj) <- merged$size
+
+# Fig. 3 in the paper:
+barplot(obj, beside=T, legend.text=T,col=c("blue" , "skyblue"))
+table(sizes_std)
+table(sizes_gr)
+
+mean(sizes_std)
+mean(sizes_gr)
+```
+Bigger prediction sets with graphs
+
+## Comparison of homogeneity of elements inside of prediction sets
+
+```{r}
+# Obtain distance matrix
+Dshortest <- distances(opi2)
+avg.dist.intra.gr <- avg.dist.intra.gr2 <- avg.dist.intra.std <- rep(NA, length(sets_cf))
+for(i in 1:length(sets_graphs)){
+  dist.gr <- as.matrix(Dshortest[sets_graphs[[i]], sets_graphs[[i]]])
+  dist.std <- as.matrix(Dshortest[sets_cf[[i]], sets_cf[[i]]])
+  avg.dist.intra.gr[i] <- sum(dist.gr)/(ncol(dist.gr)*(ncol(dist.gr)-1))
+  avg.dist.intra.std[i] <- sum(dist.std)/(ncol(dist.std)*(ncol(dist.std)-1))
+}
+
+avg.dist.intra.gr[is.na(avg.dist.intra.gr)] <- 0
+avg.dist.intra.std[is.na(avg.dist.intra.std)] <- 0
+
+mean(avg.dist.intra.gr, na.rm=T)
+mean(avg.dist.intra.std, na.rm=T)
+
+# Lower when working with graphs
+```
+
+
+
+
+
+
+
+
+
+
+
+

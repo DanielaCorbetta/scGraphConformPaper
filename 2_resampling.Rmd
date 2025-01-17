@@ -1,0 +1,546 @@
+---
+title: "Simulations for resampling strategy"
+output: 
+  html_document:
+    toc: true
+    number_sections: true
+date: "2024-03-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Code to reproduce results in section 4.1 of the paper "Conformal inference for cell type annotation with graph-structured constraints"
+
+Load libraries
+```{r, message=FALSE}
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(VGAM)
+library(igraph)
+library(scConform)
+library(ontoProc)
+library(MerfishData)
+library(ExperimentHub)
+library(kableExtra)
+
+`%notin%` = Negate(`%in%`)
+```
+
+
+# Load data and build ontology
+
+Load data and build ontology (for later)
+
+```{r}
+# Load data
+spe_baysor <- MouseIleumPetukhov2021(
+    segmentation = "baysor",
+    use.images = FALSE, use.polygons = FALSE
+)
+# Load ontology
+cl <- getOnto("cellOnto", "2023")
+
+tags <- c(
+    "CL:0009022", # Stromal
+    "CL:0000236", # B cell
+    "CL:0009080", # Tuft
+    "CL:1000411", # Endothelial
+    "CL:1000335", # Enterocyte
+    "CL:1000326", # Goblet
+    "CL:0002088", # ICC
+    "CL:0009007", # Macrophage + DC
+    "CL:1000343", # Paneth
+    "CL:0000669", # Pericyte
+    "CL:1000278", # Smooth Muscle
+    "CL:0009017", # Stem + TA
+    "CL:0000492", # T (CD4+)
+    "CL:0000625", # T (CD8+)
+    "CL:0017004" # Telocyte
+)
+opi <- graph_from_graphnel(onto_plot2(cl, tags))
+
+## Delete instances from other ontologies
+sel_ver <- V(opi)$name[c(grep("CARO", V(opi)$name), grep("BFO", V(opi)$name))]
+opi1 <- opi - sel_ver
+
+## Rename vertex to match annotations
+V(opi1)$name[grep("CL:0000236", V(opi1)$name)] <- "B cell"
+V(opi1)$name[grep("CL:1000411", V(opi1)$name)] <- "Endothelial"
+V(opi1)$name[grep("CL:1000335", V(opi1)$name)] <- "Enterocyte"
+V(opi1)$name[grep("CL:1000326", V(opi1)$name)] <- "Goblet"
+V(opi1)$name[grep("CL:0002088", V(opi1)$name)] <- "ICC"
+V(opi1)$name[grep("CL:0009007", V(opi1)$name)] <- "Macrophage + DC"
+V(opi1)$name[grep("CL:1000343", V(opi1)$name)] <- "Paneth"
+V(opi1)$name[grep("CL:0000669", V(opi1)$name)] <- "Pericyte"
+V(opi1)$name[grep("CL:1000278", V(opi1)$name)] <- "Smooth Muscle"
+V(opi1)$name[grep("CL:0009017", V(opi1)$name)] <- "Stem + TA"
+V(opi1)$name[grep("CL:0009022", V(opi1)$name)] <- "Stromal"
+V(opi1)$name[grep("CL:0000492", V(opi1)$name)] <- "T (CD4+)"
+V(opi1)$name[grep("CL:0000625", V(opi1)$name)] <- "T (CD8+)"
+V(opi1)$name[grep("CL:0017004", V(opi1)$name)] <- "Telocyte"
+V(opi1)$name[grep("CL:0009080", V(opi1)$name)] <- "Tuft"
+
+## Add the edge from connective tissue cell and telocyte and delete redundant
+## nodes
+opi1 <- add_edges(opi1, c("connective\ntissue cell\nCL:0002320", "Telocyte"))
+gr <- as_graphnel(opi1)
+opi2 <- opi1 - c(
+    "somatic\ncell\nCL:0002371", "contractile\ncell\nCL:0000183",
+    "native\ncell\nCL:0000003"
+)
+
+V(opi2)$name <- trimws(gsub("CL:.*|\\n", " ", V(opi2)$name))
+
+gr1 <- as_graphnel(opi2)
+
+## Plot the final ontology
+attrs <- list(node = list(shape = "box", fontsize = 15, fixedsize = FALSE))
+plot(gr1, attrs = attrs)
+```
+
+Preprocess data:
+```{r}
+spe_baysor$cell_type <- spe_baysor$leiden_final
+spe_baysor$cell_type[spe_baysor$cell_type %in% c(
+    "B (Follicular, Circulating)",
+    "B (Plasma)"
+)] <- "B cell"
+spe_baysor$cell_type[grep("Enterocyte", spe_baysor$cell_type)] <- "Enterocyte"
+spe_baysor <- spe_baysor[, spe_baysor$cell_type %notin% c(
+    "Removed",
+    "Myenteric Plexus"
+)]
+spe_baysor
+
+# See frequencies of cell types
+table(spe_baysor$cell_type)
+```
+
+
+## Fit a classification model
+- Randomly select 500 cells for train dataset
+- Fit logit multinomial model on the train dataset
+- Split the remaining cells into calibration (1000 cells) and test. See performance of the model on the test dataset
+
+```{r model, warning=FALSE}
+# Randomly select 500 cells
+set.seed(1703)
+train <- sample(1:ncol(spe_baysor), 500)
+
+# Training data
+spe_train <- spe_baysor[, train]
+spe_train
+spe_other <- spe_baysor[, -train]
+
+# get HVGs
+spe_train <- logNormCounts(spe_train)
+v <- modelGeneVar(spe_train)
+hvg <- getTopHVGs(v, n = 50)
+
+# Extract counts and convert data into a data.frame format
+df_train <- as.data.frame(t(as.matrix(counts(spe_train[hvg, ]))))
+df_other <- as.data.frame(t(as.matrix(counts(spe_other[hvg, ]))))
+df_train$Y <- spe_train$cell_type
+df_other$Y <- spe_other$cell_type
+table(df_train$Y)
+
+# Fit multinomial model
+fit <- vglm(Y ~ .,
+    family = multinomial(refLevel = "B cell"),
+    data = df_train
+)
+```
+
+
+# Undercovering
+
+Divide data into calibration and test set with different frequencies of cell types to simulate a label shift situation
+
+```{r}
+cl.types <- sort(unique(df_other$Y))
+props <- c(0.115, 0.019, 0.411, 0.025, 0.003, 0.064, 0.028, 0.009, 0.066, 0.126, 
+           0.095, 0.017, 0.01, 0.01, 0.002)
+names(props) <- cl.types
+set.seed(1233)
+
+idx <- unlist(lapply(cl.types, function(x) {
+  p <- props[x]
+  sample(which(df_other$Y == x), 
+         round(p*1000))
+}))
+
+df_cal <- df_other[idx,]
+df_test <- df_other[-idx,]
+
+par(mfrow=c(1,2))
+barplot(prop.table(table(df_cal$Y)), main="Calibration set")
+barplot(prop.table(table(df_test$Y)), main="Test set")
+```
+
+Fig.4 in the paper:
+
+```{r}
+bp <- barplot(rbind(prop.table(table(df_cal$Y)), prop.table(table(df_test$Y))), 
+              beside=TRUE, col=c("#1f618d","#f1c40f"), xaxt='n')
+
+pos <- c(2, 5, 8, 11, 14, 17, 20, 23, 26, 
+         29, 32, 35, 38, 41, 44)
+text(x=pos, y=par("usr")[3] - 0.02, srt=45, adj=1, labels=unique(df_cal$Y), xpd=TRUE,
+     cex=0.8)
+```
+
+
+Check that non-corrected conformal inference e conformal risk control don't work:
+
+```{r, warning=FALSE}
+p_cal <- predict(fit, newdata=df_cal, type="response")
+p_test <- predict(fit, newdata=df_test, type="response")
+# Conformal inference
+sets_cf_nc <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = FALSE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+# Check coverage
+(cvg_cf_nc <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_cf_nc)))
+# 0.878
+
+# Graph-based
+sets_graphs_nc <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+# Check coverage
+(cvg_graphs_nc <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs_nc)))
+# 0.885
+```
+
+## Two-fold resampling strategy
+
+Resample. Use first half of the observations to estimate p(Y) and evaluate the procedure on the other half. Then exchange roles.
+
+```{r}
+set.seed(1138)
+# Conformal inference
+sets_cf <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = TRUE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+# Check coverage
+(cvg_cf <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_cf)))
+#0.907
+
+# Graph-based
+sets_graphs <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = TRUE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+# Check coverage
+(cvg_graphs <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs)))
+# 0.906
+```
+
+
+More simulations
+```{r}
+sims <- function(B, pr=props, seed=12){
+  set.seed(seed)
+  conf.nonres <- crc.nonres <- conf.res <- crc.res <- rep(NA, B)
+  sets.conf.nonres <- sets.crc.nonres <- list()
+  sets.conf.res <- sets.crc.res <- list()
+  for(it in 1:B){
+    # Sample cal and test with different distributions and obtain predictions
+    ind <- unlist(lapply(cl.types, function(x) {
+      p <- pr[x]
+      sample(which(df_other$Y == x), 
+             round(p*1000))}))
+    df_cal <- df_other[ind,]
+    df_test <- df_other[-ind,]
+    p_cal <- predict(fit, newdata=df_cal, type="response")
+    p_test <- predict(fit, newdata=df_test, type="response")
+    
+    # Results without resampling
+    sets.conf.nonres[[it]] <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = FALSE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+    conf.nonres[it] <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y,
+                                   sets.conf.nonres[[it]]))
+    sets.crc.nonres[[it]] <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2, 
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+    crc.nonres[it] <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets.crc.nonres[[it]]))
+  
+    # Resample
+    sets.conf.res[[it]] <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = TRUE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+    conf.res[it] <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets.conf.res[[it]]))
+    sets.crc.res[[it]] <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = TRUE, return_sc = FALSE, onto = opi2, 
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+    crc.res[it] <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets.crc.res[[it]]))
+    cat(it)
+  }
+  return(list(conf.nonres=conf.nonres, crc.nonres=crc.nonres, conf.res=conf.res,
+         crc.res=crc.res, sets.conf.nonres=sets.conf.nonres, 
+         sets.crc.nonres=sets.crc.nonres, sets.conf.res=sets.conf.res, 
+         sets.crc.res=sets.crc.res))
+  
+}
+```
+
+Look at the mean coverages and at the empirical distributions over B=100 different split of calibration and test
+```{r, warning=FALSE}
+out <- sims(10, seed=1624)
+#save(out, file="res_two.RData)
+mean(out$conf.nonres)
+mean(out$crc.nonres)
+mean(out$conf.res)
+mean(out$crc.res)
+
+# Standard error
+sd(out$conf.nonres)/sqrt(length(out$conf.nonres))
+sd(out$crc.nonres)/sqrt(length(out$crc.nonres))
+sd(out$conf.res)/sqrt(length(out$conf.res))
+sd(out$crc.res)/sqrt(length(out$crc.res))
+
+mean(out$conf.nonres)+1.96*c(-1,1)*sd(out$conf.nonres)/sqrt(length(out$conf.nonres))
+mean(out$crc.nonres)+1.96*c(-1,1)*sd(out$crc.nonres)/sqrt(length(out$crc.nonres))
+mean(out$conf.res)+1.96*c(-1,1)*sd(out$conf.res)/sqrt(length(out$conf.res))
+mean(out$crc.res)+1.96*c(-1,1)*sd(out$crc.res)/sqrt(length(out$crc.res))
+```
+Fig. 6
+```{r}
+par(mfrow=c(1,2))
+hist(out$conf.res, ylim=c(0,50), breaks=10, main="With Resampling", freq=FALSE)
+n <- 1000
+a <- n + 1 - floor((n + 1) * 0.1)
+b <- floor((n + 1) * 0.1)
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=0.9, col=2)
+
+hist(out$conf.nonres, ylim=c(0,50), breaks=10, main="Without Resampling", freq=FALSE)
+n <- 1000
+a <- n + 1 - floor((n + 1) * 0.1)
+b <- floor((n + 1) * 0.1)
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=0.9, col=2)
+```
+
+```{r}
+par(mfrow=c(1,2))
+hist(out$crc.res, main="With resampling")
+abline(v=0.9, col=2)
+hist(out$crc.nonres, main="Without resampling")
+abline(v=0.9, col=2)
+```
+
+It is working. We are recovering the right mean coverage and the empirical distribution of the coverage of the standard conformal is approaching the theoretical known distribution.
+
+
+
+# Overcovering
+
+Consider now the opposite situation: the frequencies of the cell types in the calibration and test dataset are such that the procedure is overcovering. This means that we are obtaining sets that are too conservative and hence losing power.
+
+```{r}
+props1 <- c(0.074, 0.074, 0.074, 0.074, 0.024, 0.074, 0.074, 0.074, 0.074, 0.074,
+           0.074, 0.074, 0.074, 0.074, 0.013)
+names(props1) <- cl.types
+
+set.seed(1533)
+idx <- unlist(lapply(cl.types, function(x) {
+  p <- props1[x]
+  sample(which(df_other$Y == x), 
+         round(p*1000))
+}))
+
+df_cal <- df_other[idx,]
+df_test <- df_other[-idx,]
+
+par(mfrow=c(1,2))
+barplot(prop.table(table(df_cal$Y)), main="Calibration set")
+barplot(prop.table(table(df_test$Y)), main="Test set")
+par(mfrow=c(1,1))
+
+# Fig. 6 in the paper
+bp <- barplot(rbind(prop.table(table(df_cal$Y)), prop.table(table(df_test$Y))), 
+              beside=TRUE, col=c("#1f618d","#f1c40f"), xaxt='n',
+              main="Cell type distribution",
+              legend.text = c("Calibration", "Test"))
+
+pos <- c(2, 5, 8, 11, 14, 17, 20, 23, 26, 
+         29, 32, 35, 38, 41, 44)
+text(x=pos, y=par("usr")[3] - 0.02, srt=45, adj=1, labels=unique(df_cal$Y), xpd=TRUE,
+     cex=0.8)
+```
+
+
+Results without correction:
+
+```{r, warning=FALSE}
+p_cal <- predict(fit, newdata=df_cal, type="response")
+p_test <- predict(fit, newdata=df_test, type="response")
+
+# Conformal inference
+sets_cf_nc <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = FALSE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+# Check coverage
+(cvg_cf_nc <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_cf_nc)))
+#0.934
+# Graph-based
+sets_graphs_nc <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+# Check coverage
+(cvg_graphs_nc <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs_nc)))
+#0.932
+```
+
+Resample. Use first half of the observations to estimate p(Y) and evaluate the procedure on the other half. Then exchange roles.
+
+```{r}
+set.seed(1700)
+# Conformal inference
+sets_cf <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
+                             resample = TRUE, return_sc = FALSE, 
+                             labels = unique(df_cal$Y))
+# Check coverage
+(cvg_cf <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_cf)))
+#0.8957424
+# Graph-based
+sets_graphs <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = TRUE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6))
+# Check coverage
+(cvg_graphs <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs)))
+#0.887
+```
+
+Comparison of sizes:
+
+```{r}
+l.nonres.std <- sapply(sets_cf_nc, length)
+l.nonres.gr <- sapply(sets_graphs_nc, length)
+
+l.res.std <- sapply(sets_cf, length)
+l.res.gr <- sapply(sets_graphs, length)
+
+par(mfrow=c(2,2))
+barplot(table(l.nonres.std), main="Standard, non resampling")
+barplot(table(l.res.std), main="Standard, resampling")
+barplot(table(l.nonres.gr), main="Graph, non resampling")
+barplot(table(l.res.gr), main="Graph, resampling")
+mean(l.nonres.gr)
+mean(l.res.gr)
+```
+
+Fig. 7
+```{r}
+sizes_std_nc_df <- as.data.frame(table(l.nonres.std))
+sizes_std_c_df <- as.data.frame(table(l.res.std))
+names(sizes_std_nc_df) <- c("size", "Before_resampling")
+names(sizes_std_c_df) <- c("size", "After_resampling")
+merged <- merge(sizes_std_nc_df, sizes_std_c_df, by='size', all.x = TRUE, all.y=TRUE)
+
+merged$Before_resampling[is.na(merged$Before_resampling)] <- 0
+merged$"After_resampling"[is.na(merged$"After_resampling")] <- 0
+
+obj <- t(as.matrix(merged[,2:3]))
+colnames(obj) <- merged$size
+
+
+barplot(obj, beside=T, legend.text=T,col=c("#1f618d","#f1c40f"))
+
+sizes_gr_nc_df <- as.data.frame(table(l.nonres.gr))
+sizes_gr_c_df <- as.data.frame(table(l.res.gr))
+names(sizes_gr_nc_df) <- c("size", "Before_resampling")
+names(sizes_gr_c_df) <- c("size", "After_resampling")
+merged_gr <- merge(sizes_gr_nc_df, sizes_gr_c_df, by='size', all.x = TRUE, all.y=TRUE)
+
+merged_gr$Before_resampling[is.na(merged_gr$Before_resampling)] <- 0
+merged_gr$After_resampling[is.na(merged_gr$After_resampling)] <- 0
+
+obj_gr <- t(as.matrix(merged_gr[,2:3]))
+colnames(obj_gr) <- merged_gr$size
+
+
+barplot(obj_gr, beside=T, legend.text=T,col=c("#1f618d","#f1c40f"))
+```
+
+
+More simulations
+```{r}
+out.bis <- sims(B = 100, pr = props1, seed=1715)
+```
+
+```{r}
+mean(out.bis$conf.nonres)
+mean(out.bis$crc.nonres)
+mean(out.bis$conf.res)
+mean(out.bis$crc.res)
+```
+
+Fig. 8 
+```{r}
+par(mfrow=c(1,2))
+hist(out.bis$conf.res, ylim=c(0,42), breaks=10, main="With Resampling", freq=FALSE)
+n <- 1000
+a <- n + 1 - floor((n + 1) * 0.1)
+b <- floor((n + 1) * 0.1)
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=0.9, col=2)
+
+hist(out.bis$conf.nonres, breaks=10, main="Without Resampling", freq=FALSE)
+n <- 1000
+a <- n + 1 - floor((n + 1) * 0.1)
+b <- floor((n + 1) * 0.1)
+curve(dbeta(x, a, b), n=10^6, col=4, add=T)
+abline(v=0.9, col=2)
+```
+
+```{r}
+par(mfrow=c(1,2))
+hist(out.bis$crc.res, main="With resampling")
+abline(v=0.9, col=2)
+hist(out.bis$crc.nonres, main="Without resampling")
+abline(v=0.9, col=2)
+```
+
+
+Difference in mean size:
+```{r}
+l.mean.nonres.conf <- l.mean.nonres.crc <- l.mean.res.conf <- l.mean.res.crc <- rep(NA, length(out.bis$sets.conf.nonres))
+for(i in 1:length(out.bis$sets.conf.nonres))
+  l.mean.nonres.conf[i] <- mean(sapply(out.bis$sets.conf.nonres[[i]], length))
+for(i in 1:length(out.bis$sets.crc.nonres))
+  l.mean.nonres.crc[i] <- mean(sapply(out.bis$sets.crc.nonres[[i]], length))
+for(i in 1:length(out.bis$sets.conf.res))
+  l.mean.res.conf[i] <- mean(sapply(out.bis$sets.conf.res[[i]], length))
+for(i in 1:length(out.bis$sets.crc.res))
+  l.mean.res.crc[i] <- mean(sapply(out.bis$sets.crc.res[[i]], length))
+par(mfrow=c(2,2))
+hist(l.mean.nonres.conf, main="Conformal, non resampling")
+hist(l.mean.res.conf, main="Conformal, resampling")
+hist(l.mean.nonres.crc, main="Graph, non resampling")
+hist(l.mean.res.crc, main="Graph, resampling")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
