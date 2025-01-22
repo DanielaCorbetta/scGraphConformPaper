@@ -28,6 +28,7 @@ library(MerfishData)
 library(ExperimentHub)
 library(kableExtra)
 library(scConform)
+library(BiocParallel)
 `%notin%` = Negate(`%in%`)
 ```
 
@@ -119,6 +120,10 @@ spe_baysor
 
 # See frequencies of cell types
 table(spe_baysor$cell_type)
+```
+Add quality control metrics:
+```{r}
+spe_baysor <- addPerCellQCMetrics(spe_baysor)
 ```
 
 
@@ -239,14 +244,122 @@ mean(avg.dist.intra.std, na.rm=T)
 # Lower when working with graphs
 ```
 
+# Inspect cells with inconclusive predictions
+```{r}
+spe_test <- spe_other[,-cal]
+spe_test$sizes_gr <- as.factor(sizes_gr)
+table(spe_test$sizes_gr)
+```
+```{r}
+ggplot(colData(spe_test), aes(sizes_gr, detected))+ geom_violin()
+ggplot(colData(spe_test), aes(sizes_gr, sum, fill=sizes_gr))+ geom_violin()+ scale_fill_brewer(palette = "Pastel2")
+```
+
+```{r}
+ggplot(colData(spe_test)[spe_test$sizes_gr%in% c("1", "15"),], aes(sizes_gr, detected))+ geom_violin()
+ggplot(colData(spe_test)[spe_test$sizes_gr%in% c("1", "15"),], 
+       aes(sizes_gr, sum, fill=sizes_gr)) + geom_violin()+theme_minimal()+
+  ylab("Total counts per cell")+xlab("Size of graph-based set")+
+  scale_fill_brewer(palette = "Pastel1") + theme(legend.position = "none")
+```
 
 
+See spatial distribution of inconclusive cells
+
+```{r}
+spe_test$inconclusive <- ifelse(spe_test$sizes_gr=="15", "yes", "no")
+spe_test$x <- spatialCoords(spe_test)[,1]
+spe_test$y <- spatialCoords(spe_test)[,2]
+ggplot(data = colData(spe_test), 
+       aes(x = x, y = y, color = inconclusive)) +
+  geom_point() +
+  labs(x = "Spatial Coordinate 1", 
+       y = "Spatial Coordinate 2") 
+ggplot(data = colData(spe_test), 
+       aes(x = x, y = y, color = sizes_gr)) +
+  geom_point() +
+  labs(x = "Spatial Coordinate 1", 
+       y = "Spatial Coordinate 2") 
+```
+
+```{r}
+# Re-Downloaded to get the images
+spe.baysor <- MouseIleumPetukhov2021(segmentation = "baysor")
+mem.img <- imgRaster(spe.baysor, image_id = "membrane")
+plotXY(colData(spe_test), "inconclusive", mem.img)
+```
+
+```{r}
+plotXY(colData(spe_test), "cell_type", mem.img)
+round(prop.table(table(spe_test$inconclusive, spe_test$cell_type),2),3)
+```
+
+```{r}
+# See model accuracy stratified by cell type
+pr_class <- apply(p_test, 1, function(row) colnames(p_test)[which.max(row)])
+mean(pr_class==df_test$Y)
+
+accuracy_by_group <- tapply(seq_along(df_test$Y), df_test$Y, function(idx) {
+  mean(pr_class[idx] == df_test$Y[idx])
+})
+
+# Print results
+accuracy_by_group
+round(prop.table(table(spe_test$inconclusive, spe_test$cell_type),2),3)
+```
 
 
+```{r}
+spe_rm <- spe.baysor[,spe.baysor$leiden_final %in% c("Removed", "Myenteric Plexus")]
+p_rm <- predict(fit, newdata=as.data.frame(t(as.matrix(counts(spe_rm[hvg, ])))),
+                type="response")
+sets_gr_rm <- getPredictionSets(p_rm, p_cal, df_cal$Y,follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6)
+                                )
+sets_split_rm <- getPredictionSets(p_rm, p_cal, df_cal$Y,follow_ontology = FALSE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 6)
+                                )
+
+```
+
+```{r}
+sizes <- sapply(sets_gr_rm, length)
+round(prop.table(table(sizes, spe_rm$leiden_final),2),3)
+
+sizes_sp <- sapply(sets_split_rm, length)
+round(prop.table(table(sizes_sp, spe_rm$leiden_final),2),3)
+
+```
 
 
+```{r}
+pr_rm <- apply(p_rm, 1, function(row) colnames(p_rm)[which.max(row)])
+table(pr_rm[spe_rm$leiden_final=="Removed"], sizes[spe_rm$leiden_final=="Removed"])
+table(pr_rm[spe_rm$leiden_final=="Myenteric Plexus"], sizes[spe_rm$leiden_final=="Myenteric Plexus"])
+```
 
+Common label:
+```{r}
+spe_test$comm_anc <- vapply(
+            sets_graphs,
+            function(x) scConform::getCommonAncestor(x, opi2),
+            character(1)
+        )
+table(spe_test$comm_anc)
+table(spe_test$sizes_gr)
 
+ch <- rep(NA, length(spe_test$comm_anc))
+for(i in seq_along(spe_test$comm_anc))
+  ch[i] <- length(scConform:::.children(spe_test$comm_anc[[i]], opi2)) == length(sets_graphs[[i]])
+sum(!ch)
+```
 
+```{r}
+plotXY(colData(spe_test), "comm_anc", mem.img)
+```
 
 
