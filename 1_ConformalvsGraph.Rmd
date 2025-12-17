@@ -29,6 +29,8 @@ library(ExperimentHub)
 library(kableExtra)
 library(scConform)
 library(BiocParallel)
+library(tidyr)
+library(ggplot2)
 `%notin%` = Negate(`%in%`)
 ```
 
@@ -189,7 +191,7 @@ sets_cf <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
 sets_graphs <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
                              resample = FALSE, return_sc = FALSE, onto = opi2,
                              labels = unique(df_cal$Y),
-                             BPPARAM = MulticoreParam(workers = 6))
+                             BPPARAM = MulticoreParam(workers = 4))
 # Check coverage
 (cvg_graphs <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs)))
 ```
@@ -202,23 +204,30 @@ sizes_std <- sapply(sets_cf, length)
 sizes_gr <- sapply(sets_graphs, length)
 sizes_std_df <- as.data.frame(table(sizes_std))
 sizes_gr_df <- as.data.frame(table(sizes_gr))
-names(sizes_std_df) <- c("size", "Standard")
+names(sizes_std_df) <- c("size", "Split")
 names(sizes_gr_df) <- c("size", "Graphs")
 merged <- merge(sizes_std_df, sizes_gr_df, by='size', all.x = TRUE, all.y=TRUE)
 
 merged$Graphs[is.na(merged$Graphs)] <- 0
-merged$Standard[is.na(merged$Standard)] <- 0
+merged$Split[is.na(merged$Split)] <- 0
 
-obj <- t(as.matrix(merged[,2:3]))
-colnames(obj) <- merged$size
-
-# Fig. 3 in the paper:
-barplot(obj, beside=T, legend.text=T,col=c("blue" , "skyblue"))
 table(sizes_std)
 table(sizes_gr)
 
 mean(sizes_std)
 mean(sizes_gr)
+
+long_df <- pivot_longer(merged, cols = c("Split", "Graphs"), 
+                        names_to = "Group", values_to = "Count")
+long_df$size <- as.factor(long_df$size)  # for categorical x-axis
+long_df$Group <- factor(long_df$Group, levels = c("Split", "Graphs"))
+
+# Fig.3 in the paper
+ggplot(long_df, aes(x = size, y = Count, fill = Group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+  scale_fill_manual(values = c("Split" = "#B2DF8A", "Graphs" = "#CAB2D6")) +
+  labs(x = "Set Size", y = "Frequency", fill = "Method") +
+  theme_minimal(base_size = 14)
 ```
 Bigger prediction sets with graphs
 
@@ -243,6 +252,401 @@ mean(avg.dist.intra.std, na.rm=T)
 
 # Lower when working with graphs
 ```
+
+```{r}
+s_h_gr <- data.frame(distance=avg.dist.intra.gr, size=sizes_gr)
+mean(s_h_gr$distance[s_h_gr$size==1])
+boxplot(s_h_gr$distance~s_h_gr$size)
+
+s_h_std <- data.frame(distance=avg.dist.intra.std, size=sizes_std)
+mean(s_h_std$distance[s_h_std$size==1])
+boxplot(s_h_std$distance~s_h_std$size)
+
+avg.dist.intra.gr
+sizes_gr
+```
+
+
+```{r}
+library(ggplot2)
+library(ggdist)
+# Combine data
+s_h_gr$method <- "Graphs"
+s_h_std$method <- "Split"
+combined <- rbind(s_h_gr, s_h_std)
+
+# Convert size to factor if not already
+combined$size <- factor(combined$size)
+
+combined <- combined[combined$size!=1,]
+combined$method <- factor(combined$method, levels = c("Split", "Graphs"))
+# Plot
+
+
+ggplot(combined, aes(x = size, y = distance)) +
+  geom_boxplot(aes(fill = method), alpha=0.5) +
+  geom_swarm(
+    aes(color = method, group = method), 
+    position = position_dodge(width = 0.75)
+  ) +
+  labs(title = "Intra-group Distance by Size and Method",
+       x = "Size", y = "Distance") +
+  scale_fill_manual(values = c("Graphs" = "#CAB2D6", "Split" = "#B2DF8A")) +
+  scale_color_manual(values = c("Graphs" = "#6A3D9A", "Split" = "#33A02C")) + 
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+```{r}
+unique(sets_graphs[sizes_gr==7])
+avg.dist.intra.gr[sizes_gr==4]
+```
+
+
+# Calibration set size
+
+Consideration on the appropriate size of the calibration set. In the
+standard case, there is a result that states
+$$ P(Y_{test} \in C(X_{test})| \{(X_i, Y_i)_{i=1}^{n_{cal}}\}) \sim Beta(n+1-l,l),$$
+with $l=\lfloor(n+1)\alpha\rfloor$. In our case there is not a similar result.
+To evaluate the appropriate calibration set size, apply the algorithm with $n_{cal}\in\{10,50,100,500,1000\}$
+on $B=100$ different calibration/test splits
+
+```{r}
+conf.pred.n <- function(B, n){
+  cvg.crc <- cvg.conf <- rep(NA, B)
+  for(i in 1:B){
+    cal <- sample(1:nrow(df_other), n)
+    df.cal <- df_other[cal,]
+    df.test <- df_other[-cal,]
+    p.cal <- predict(fit, newdata=df.cal, type="response")
+    p.test <- predict(fit, newdata=df.test, type="response")
+    sets_cf <- getPredictionSets(p.test, p.cal, df.cal$Y, follow_ontology = FALSE,
+                                 resample = FALSE, return_sc = FALSE, 
+                                 labels = unique(df_cal$Y))
+    cvg.conf[i] <- mean(mapply(function(vec, lst) vec %in% lst, df.test$Y, sets_cf))
+    
+    sets_graphs <- getPredictionSets(p.test, p.cal, df.cal$Y, follow_ontology = TRUE,
+                                     resample = FALSE, return_sc = FALSE, onto = opi2,
+                                     labels = unique(df_cal$Y),
+                                     BPPARAM = MulticoreParam(workers = 6))
+    cvg.crc[i] <- mean(mapply(function(vec, lst) vec %in% lst, df.test$Y, sets_graphs))
+    if(i%%10==0) cat(i)
+  }
+  return(list(cvg.conf=cvg.conf, cvg.crc=cvg.crc))
+}
+```
+
+```{r}
+set.seed(1221)
+n100 <- conf.pred.n(B=100, n=100)
+#save(n100, file="n100.RData")
+n500 <- conf.pred.n(B=100, n=500)
+#save(n500, file="n500.RData")
+n1000 <- conf.pred.n(B=100, n=1000)
+#save(n1000, file="n1000.RData")
+```
+
+```{r}
+lapply(n100, mean)
+lapply(n500, mean)
+lapply(n1000, mean)
+
+lapply(n100, sd)
+lapply(n500, sd)
+lapply(n1000, sd)
+
+# Theoretical dist
+var.beta <- function(alpha=0.1, n){
+  l <- floor((n+1)*alpha)
+  ((n+1-l)*l)/((n+1)^2*(n+2))
+}
+
+mean.beta <- function(alpha=0.1, n){
+  l <- floor((n+1)*alpha)
+  (n+1-l)/(n+1)
+}
+
+n_list <- c(100, 500, 1000)
+
+th.var <- sapply(n_list, function(n) var.beta(n=n))
+round(th.var,5)
+th.mean <- sapply(n_list, function(n) mean.beta(n=n))
+th.mean
+
+emp.var <- c(
+  var(n100[[1]]),
+  var(n500[[1]]),
+  var(n1000[[1]])
+)
+
+emp.var.crc <- c(
+  var(n100[[2]]),
+  var(n500[[2]]),
+  var(n1000[[2]])
+)
+
+emp.m <- c(
+  mean(n100[[1]]),
+  mean(n500[[1]]),
+  mean(n1000[[1]])
+)
+
+emp.m.crc <- c(
+  mean(n100[[2]]),
+  mean(n500[[2]]),
+  mean(n1000[[2]])
+)
+
+
+```
+
+```{r}
+plot(1, type = "n",
+     xlim = c(min(n_list)-1, max(n_list)+1), 
+     ylim = c(
+       min(c(emp.m - sqrt(emp.var),
+             emp.m.crc - sqrt(emp.var.crc),
+             th.mean - sqrt(th.var))),
+       max(c(emp.m + sqrt(emp.var),
+             emp.m.crc + sqrt(emp.var.crc),
+             th.mean + sqrt(th.var)))
+     ),
+     xlab = "Calibration set size",
+     ylab = "Values",
+     main = "Means ± Standard Deviations"
+)
+
+points(n_list, emp.m, pch = 16, col = "red")
+for (i in seq_along(n_list)) {
+  arrows(n_list[i], emp.m[i] - sqrt(emp.var)[i],
+         n_list[i], emp.m[i] + sqrt(emp.var)[i],
+         angle = 90, code = 3, length = 0.1, col = "red")
+}
+
+points(n_list, emp.m.crc, pch = 17, col = "blue")
+for (i in seq_along(n_list)) {
+  arrows(n_list[i], emp.m.crc[i] - sqrt(emp.var.crc)[i],
+         n_list[i], emp.m.crc[i] + sqrt(emp.var.crc)[i],
+         angle = 90, code = 3, length = 0.1, col = "blue")
+}
+
+points(n_list, th.mean, pch = 15, col = "darkgreen")
+for (i in seq_along(n_list)) {
+  arrows(n_list[i], th.mean[i] - sqrt(th.var)[i],
+         n_list[i], th.mean[i] + sqrt(th.var)[i],
+         angle = 90, code = 3, length = 0.1, col = "darkgreen")
+}
+
+abline(h = 0.9, lty = 2)
+legend("topleft",
+       legend = c("empirical", "CRC", "theoretical"),
+       col = c("red", "blue", "darkgreen"),
+       pch = c(16, 17, 15),
+       bty = "n")
+
+```
+
+```{r}
+library(ggplot2)
+
+# Larger staggering since n_list = c(100,500,1000)
+offset_emp <- -20
+offset_crc <-   0
+offset_th  <- +20
+
+df_plot <- data.frame(
+  n = rep(n_list, 3),
+  mean = c(emp.m,          emp.m.crc,          th.mean),
+  sd   = c(sqrt(emp.var),  sqrt(emp.var.crc),  sqrt(th.var)),
+  type = rep(c("emp_mean", "crc_mean", "th_mean"), each = length(n_list)),
+  sd_type = rep(c("emp_sd", "crc_sd", "th_sd"), each = length(n_list)),
+  x = c(n_list + offset_emp,
+        n_list + offset_crc,
+        n_list + offset_th)
+)
+
+p.meansd <- ggplot() +
+  # Means
+  geom_point(data = df_plot, 
+             aes(x = x, y = mean, color = type),
+             size = 3) +
+  
+  # SD bars with their own colors
+  geom_errorbar(data = df_plot,
+                aes(x = x, ymin = mean - sd, ymax = mean + sd, color = sd_type),
+                width = 10, alpha = 0.9) +
+  
+  geom_hline(yintercept = 0.9, linetype = "dashed") +
+  
+  scale_color_manual(
+    values = c(
+      # Means
+      "emp_mean" = "#33A02C",
+      "crc_mean" = "#6A3D9A",
+      "th_mean"  = "#7F7F7F",
+      # SD bars
+      "emp_sd" = "#B2DF8A",
+      "crc_sd" = "#CAB2D6",
+      "th_sd"  = "#CFCFCF"
+    ),
+    breaks = c("emp_mean","crc_mean","th_mean"),
+    labels = c("Split","Graphs","Theoretical")
+  ) +
+  
+  scale_x_continuous(
+    breaks = n_list,
+    labels = n_list
+  ) +
+  
+  labs(
+    x = "Calibration set size",
+    y = "Values",
+    color = ""
+  ) +
+  
+  theme_minimal(base_size = 15) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )+ggtitle("Empirical mean coverage with standard errors")
+
+n_values <- c(10,50,100,500,1000)
+alpha <- 0.1
+ccol1 <- c("red", "yellow", "green", "blue", "purple")
+plot(0, type='n', xlim=c(0.8, 1), ylim=c(0, 44), xlab='x', ylab='Density', 
+     main="Beta density")
+
+for (i in 1:length(n_values)) {
+  n <- n_values[i]
+  a <- n + 1 - floor((n + 1) * alpha)
+  b <- floor((n + 1) * alpha)
+  curve(dbeta(x, a, b), add = TRUE, col = ccol1[i], n=10^6)
+}
+abline(v=1-alpha, lty=2, col="grey")
+legend("topright", legend = n_values, col = ccol1, lty = 1, title="n")
+
+```
+
+
+```{r}
+n <- 100
+alpha <- 0.1
+a <- n + 1 - floor((n + 1) * alpha)
+b <- floor((n + 1) * alpha)
+curve(dbeta(x, a, b), col = "#7F7F7F", n=10^6, xlim=c(0.82,0.98), ylim=c(0,18),
+      main="n_cal=100", xlab="", ylab="")
+lines(density(n100$cvg.conf), col = "#33A02C")
+lines(density(n100$cvg.crc), col="#6A3D9A")
+
+n <- 500
+alpha <- 0.1
+a <- n + 1 - floor((n + 1) * alpha)
+b <- floor((n + 1) * alpha)
+curve(dbeta(x, a, b), col = "#7F7F7F", n=10^6, xlim=c(0.82,0.98),
+       main="n_cal=500", xlab="", ylab="")
+lines(density(n500$cvg.conf), col = "#33A02C")
+lines(density(n500$cvg.crc), col="#6A3D9A")
+
+n <- 1000
+alpha <- 0.1
+a <- n + 1 - floor((n + 1) * alpha)
+b <- floor((n + 1) * alpha)
+curve(dbeta(x, a, b), col = "#7F7F7F", n=10^6, xlim=c(0.82,0.98),
+       main="n_cal=1000", xlab="", ylab="")
+lines(density(n1000$cvg.conf), col = "#33A02C")
+lines(density(n1000$cvg.crc), col="#6A3D9A")
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+make_df <- function(vec, label) {
+  data.frame(
+    x = vec,
+    type = label
+  )
+}
+
+# Build data for the three n values
+all_df <- list()
+
+for (n in c(100, 500, 1000)) {
+  
+  alpha <- 0.1
+  a <- n + 1 - floor((n + 1) * alpha)
+  b <- floor((n + 1) * alpha)
+  
+  # theoretical beta density (sample a grid)
+  xgrid <- seq(0.82, 0.98, length.out = 100)
+  df_beta <- data.frame(
+    x = xgrid,
+    density = dbeta(xgrid, a, b),
+    type = "Theoretical",
+    n = paste0("n_cal = ", n)
+  )
+  
+  # empirical densities
+  df_conf <- make_df(get(paste0("n", n))$cvg.conf, "Split")
+  df_crc  <- make_df(get(paste0("n", n))$cvg.crc,  "Graphs")
+  
+  df_conf <- df_conf %>%
+    mutate(
+      density = density(x, from = 0.82, to = 0.98, n = 100)$y,
+      x = density(x, from = 0.82, to = 0.98, n = 100)$x,
+      n = paste0("n_cal = ", n)
+    )
+  
+  df_crc <- df_crc %>%
+    mutate(
+      density = density(x, from = 0.82, to = 0.98, n = 100)$y,
+      x = density(x, from = 0.82, to = 0.98, n = 100)$x,
+      n = paste0("n_cal = ", n)
+    )
+
+  all_df[[as.character(n)]] <- rbind(df_beta, df_conf, df_crc)
+}
+
+df_final <- bind_rows(all_df)
+
+# Colors
+col_map <- c(
+  "Theoretical" = "#7F7F7F",
+  "Split" = "#33A02C",
+  "Graphs" = "#6A3D9A"
+)
+
+df_final$n <- factor(df_final$n,
+                     levels = c("n_cal = 100", "n_cal = 500", "n_cal = 1000"))
+
+
+# Plot
+p.density <- ggplot(df_final, aes(x = x, y = density, color = type)) +
+  geom_line(size = 0.5) +
+  facet_wrap(~ n, nrow = 3, scales = "free_y") +
+  scale_color_manual(values = col_map) +
+  coord_cartesian(xlim = c(0.82, 0.98)) +
+  labs(
+    x = "",
+    y = "",
+    color = ""
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "top",
+    panel.grid.minor = element_blank()
+  )
+
+```
+
 
 # Inspect cells with inconclusive predictions
 ```{r}
@@ -316,12 +720,12 @@ p_rm <- predict(fit, newdata=as.data.frame(t(as.matrix(counts(spe_rm[hvg, ])))),
 sets_gr_rm <- getPredictionSets(p_rm, p_cal, df_cal$Y,follow_ontology = TRUE,
                              resample = FALSE, return_sc = FALSE, onto = opi2,
                              labels = unique(df_cal$Y),
-                             BPPARAM = MulticoreParam(workers = 6)
+                             BPPARAM = MulticoreParam(workers = 4)
                                 )
 sets_split_rm <- getPredictionSets(p_rm, p_cal, df_cal$Y,follow_ontology = FALSE,
                              resample = FALSE, return_sc = FALSE, onto = opi2,
                              labels = unique(df_cal$Y),
-                             BPPARAM = MulticoreParam(workers = 6)
+                             BPPARAM = MulticoreParam(workers = 4)
                                 )
 
 ```

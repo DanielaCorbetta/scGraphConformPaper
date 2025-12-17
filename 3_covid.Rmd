@@ -20,6 +20,8 @@ library(igraph)
 library(ontoProc)
 library(scConform)
 library(BiocParallel)
+library(org.Hs.eg.db)
+library(batchelor)
 ```
 
 
@@ -133,7 +135,42 @@ V(onto)$name <- sub("CL:.*", "", V(onto)$name)
 
 pan.gr1 <- as_graphnel(onto)
 plot(pan.gr1, attrs=list(node=list(fontsize=27, shape="box")))
+
 ```
+
+
+```{r}
+node_colors <- c(
+  "lymphocyte of B lineage " = "gray80",           
+  "antibody secreting cell " = "#D73027",           
+  "long lived plasma cell " = "#FC8D59",           
+  "IgA plasma cell" = "#FEE090",                   
+  "IgM plasma cell" = "#FEC44F",                  
+  "B cell, CD19-positive " = "#4575B4",             
+  "mature B cell " = "#3288BD" ,                     
+  "naive B cell" = "#74ADD1",                     
+  "immature B cell" = "#1C9099",                   
+  "memory B cell " = "#91BFDB",                     
+  "class switched memory B cell" = "#66C2A5",      
+  "unswitched memory B cell" = "#41B6C4",          
+  "IgG plasma cell" = "#FDAE61",                   
+  "plasmablast" = "#E34A33"                       
+)
+
+nodeAttrs <- list(fillcolor = node_colors)
+
+plot(pan.gr1,
+     nodeAttrs = nodeAttrs,
+     attrs = list(
+       node = list(fontsize = 27, shape = "box", style = "filled",
+                   fixedsize = FALSE)
+     ))
+
+
+```
+
+
+
 
 # Uncertainty quantification
 
@@ -153,6 +190,21 @@ other
 other.bal <- other[,idx]
 barplot(prop.table(table(other$cell_type_curated)))
 barplot(prop.table(table(other.bal$cell_type_curated)))
+
+other.bal <- logNormCounts(other.bal)
+test <- logNormCounts(test)
+v <- modelGeneVar(other.bal)
+hvg <- getTopHVGs(v, n=50)
+
+df <- as.data.frame(t(as.matrix(logcounts(other.bal[hvg,])))) 
+df$Y <- other.bal$cell_type_curated
+
+set.seed(1312)
+cal <- sample(1:dim(other.bal)[2], 1000)
+df.train <- df[-cal,]
+df.cal <- df[cal,]
+df.test <- as.data.frame(t(as.matrix(logcounts(test[hvg,]))))
+df.test$Y <- test$cell_type_curated
 ```
 
 Fit model (Isabella N Grabski, Rafael A Irizarry, A probabilistic gene expression barcode for annotation of cell types from single-cell RNA-seq data, Biostatistics, Volume 23, Issue 4, October 2022, Pages 1150–1164)
@@ -160,7 +212,6 @@ Fit model (Isabella N Grabski, Rafael A Irizarry, A probabilistic gene expressio
 ```{r}
 # Grabsky Irizzarry
 source('cell_type_identification4_clean.R')
-library(org.Hs.eg.db)
 
 ### Preparation for symbol->ENSEMBL conversion
 Hs_symbol <- org.Hs.egSYMBOL
@@ -171,13 +222,21 @@ mapped_Hs_genes.ensembl <- mappedkeys(Hs_ensembl)
 Hs_ensembl.df <- as.data.frame(Hs_ensembl[mapped_Hs_genes.ensembl])
 Hs_mapping <- merge(Hs_symbol.df,Hs_ensembl.df)
 
+spe_cal <- other.bal[,cal]
+spe_train <- other.bal[,-cal]
+
 rownames(spe_train) <- Hs_mapping$ensembl_id[match(rownames(spe_train),
                                                        Hs_mapping$symbol)]
 rownames(test) <- Hs_mapping$ensembl_id[match(rownames(test),
                                                        Hs_mapping$symbol)]
 rownames(spe_cal) <- Hs_mapping$ensembl_id[match(rownames(spe_cal),
                                                        Hs_mapping$symbol)]
-
+is_bad <- is.na(rownames(spe_train))
+spe_train <- spe_train[!is_bad, ]
+is_bad <- is.na(rownames(test))
+test <- test[!is_bad, ]
+is_bad <- is.na(rownames(spe_cal))
+spe_cal <- spe_cal[!is_bad, ]
 # Train on reference
 train.d <- trainAllReference(as.matrix(counts(spe_train)),
   spe_train$cell_type_curated,discrim_only=TRUE)
@@ -191,7 +250,7 @@ cal.pred <- classifyTarget(as.matrix(counts(spe_cal)), train.d, return.probs = T
 Compare coverage with and without resampling correction
 ```{r}
 labels <- V(onto)$name[degree(onto, mode = "out") == 0]
-spe_cal <- other.bal[,cal]
+set.seed(1)
 # Create corresponding colData
 for (i in labels) {
     colData(spe_cal)[[i]] <- cal.pred[, i]
@@ -230,18 +289,18 @@ test <- getPredictionSets(x_query=test, x_cal=spe_cal,
                           onto=onto, pr_name = "pr_crc_res1",
                           BPPARAM = MulticoreParam(workers = 6))
 mean(mapply(`%in%`, test$cell_type_curated, test$pr_crc_res1))
-# 0.915
+# 0.916
 ```
 
 Compare results with an estimated oracle correction that resamples based on the real values of the proportions in the test set
 ```{r}
 resample.oracle <- function(cal, test, cal.pred, seed = NA) {
   if (!is.na(seed)) set.seed(seed)
-  
+
   cal_freq <- prop.table(table(cal$Y))
   test_freq <- prop.table(table(test$Y))
   des_freq <- round(test_freq * length(cal$Y))
-  
+
   idx <- NULL
   for (i in unique(test$Y)) {
     cat <- which(cal$Y == i)
@@ -250,38 +309,40 @@ resample.oracle <- function(cal, test, cal.pred, seed = NA) {
       idx <- c(idx, idx_cat)
     }
   }
-  
+
   return(list(cal = cal[idx, ], p.cal = cal.pred[idx, ]))
 }
 
-cal_oracle <- resample.oracle(df.cal, df.test, pr.cal, seed=1)
+pr.cal <- apply(cal.pred, 1, function(i) names(i)[which.max(i)])
+set.seed(1133)
+cal_oracle <- resample.oracle(df.cal, df.test, cal.pred, seed=1)
 
-oracle_sets <- getPredictionSets(x_query=pr, x_cal=cal_oracle$p.cal, 
+oracle_sets <- getPredictionSets(x_query=test.pred, x_cal=cal_oracle$p.cal,
                           y_cal=cal_oracle$cal$Y,
                           alpha=0.1, follow_ontology = FALSE, resample=FALSE,
                           return_sc=FALSE, onto=onto)
 mean(mapply(`%in%`, test$cell_type_curated, oracle_sets))
-#0.918
-oracle_sets_gr <- getPredictionSets(x_query=pr, x_cal=cal_oracle$p.cal, 
+#0.910
+oracle_sets_gr <- getPredictionSets(x_query=test.pred, x_cal=cal_oracle$p.cal,
                           y_cal=cal_oracle$cal$Y,
                           alpha=0.1, follow_ontology = TRUE, resample=FALSE,
                           onto=onto, return_sc=FALSE,
                           BPPARAM = MulticoreParam(workers = 6))
 
 mean(mapply(`%in%`, test$cell_type_curated, oracle_sets_gr))
-#0.896
+#0.902
 ```
 
 Obtain prediction sets
 ```{r}
-cal.pred <- classifyTarget(as.matrix(counts(spe_cal)), train.d, return.probs = T)
-pr_GI <- getPredictionSets(x_query=test.pred, x_cal=cal.pred, 
-                          y_cal=spe_cal$cell_type_curated,
-                          alpha=0.1, follow_ontology = TRUE, resample=TRUE,
-                          onto=onto, return_sc = FALSE,
-                          BPPARAM = MulticoreParam(workers = 6))
-mean(sapply(pr_GI, length))
-table(sapply(pr_GI, length))
+# cal.pred <- classifyTarget(as.matrix(counts(spe_cal)), train.d, return.probs = T)
+# pr_GI <- getPredictionSets(x_query=test.pred, x_cal=cal.pred, 
+#                           y_cal=spe_cal$cell_type_curated,
+#                           alpha=0.1, follow_ontology = TRUE, resample=TRUE,
+#                           onto=onto, return_sc = FALSE,
+#                           BPPARAM = MulticoreParam(workers = 6))
+# mean(sapply(pr_GI, length))
+# table(sapply(pr_GI, length))
 ```
 
 ```{r}
@@ -306,7 +367,7 @@ getCommAnc <- function (pred_set, onto)
 
 ```{r}
 test$comm_anc_GI <- vapply(
-            test$pr_crc_res,
+            test$pr_crc_res1,
             function(x) getCommAnc(x, onto),
             character(1)
         )
@@ -314,7 +375,7 @@ test$comm_anc_GI <- vapply(
 ## Check 
 ch <- rep(NA, length(test$comm_anc_GI))
 for(i in seq_along(test$comm_anc_GI))
-  ch[i] <- length(scConform:::.children(test$comm_anc_GI[[i]], onto)) == length(test$pr_crc_res[[i]])
+  ch[i] <- length(scConform:::.children(test$comm_anc_GI[[i]], onto)) == length(test$pr_crc_res1[[i]])
 sum(!ch)
 
 # Define the color vector
@@ -337,7 +398,9 @@ color_vector <- c(
 )
 
 # Add point predictions
+pr.class <- apply(test.pred, 1, function(i) names(i)[which.max(i)])
 test$pr_label <- pr.class
+mean(test$cell_type_curated==test$pr_label)
 
 test <- logNormCounts(test)
 test <- runPCA(test, name="PCA")
@@ -348,16 +411,152 @@ plotTSNE(test, color_by = "cell_type_curated") +
     scale_color_manual(values = color_vector) +
     labs(color = "Ground truth")
 p1 <- plotTSNE(test, color_by = "pr_label") +
-    scale_color_manual(values = color_vector) +
-    labs(color = "Point predictions")
+    scale_color_manual(values = node_colors) +
+    labs(color = "Point predictions")+ggtitle("Point predictions")+
+    theme(legend.position = "none")
 p2 <- plotTSNE(test, color_by = "comm_anc_GI") +
-    scale_color_manual(values = color_vector) +
-    labs(color = "Graph-based labels")
+    scale_color_manual(values = node_colors) +
+    labs(color = "Graph-based labels")+
+    theme(legend.position = "none")+ggtitle("Graph-based sets")
 
 library(ggpubr)
 ggarrange(p1, p2, ncol=2, nrow=1)
 
 ```
 
+Plot with cells colored by correct/wrong label
 
+```{r}
+test$YN_pp <- ifelse(test$cell_type_curated==test$pr_label, "Yes", "No")
 
+test$YN_crc <- ifelse(mapply(`%in%`, test$cell_type_curated, test$pr_crc_res1),
+                      "Yes", "No")
+
+p3 <- plotTSNE(test, color_by = "YN_pp") +
+  scale_color_manual(
+    values = c(
+      "Yes" = "#7F7F7F",   # gray (colorblind safe)
+      "No"  = "#D55E00"    # blue (from the Okabe–Ito palette)
+    ),
+    name = "correct"
+  ) +
+  ggtitle("Point predictions")
+
+p4 <- plotTSNE(test, color_by = "YN_crc") +
+  scale_color_manual(
+    values = c(
+      "Yes" = "#7F7F7F",   # gray (colorblind safe)
+      "No"  = "#D55E00"    # blue (from the Okabe–Ito palette)
+    ),
+    name = "included"
+  ) +
+  ggtitle("Graph-based sets")
+
+library(ggpubr)
+ggarrange(p3, p4, ncol=2, nrow=1)
+```
+
+```{r}
+tab <- prop.table(table(test$comm_anc_GI, test$cell_type_curated), 2)
+
+cols <- node_colors[rownames(tab)]
+
+bp <- barplot(
+  tab,
+  beside = FALSE,
+  col = cols,
+  legend = FALSE,
+  ylab = "Predicted ancestor",
+  xlab = "True cell types"
+)
+
+legend(
+  "topright",
+  legend = rownames(tab),
+  fill = cols,
+  cex = 0.8
+)
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+
+tab <- prop.table(table(test$comm_anc_GI, test$cell_type_curated), 2)
+df <- as.data.frame(tab)
+colnames(df) <- c("comm_anc_GI", "cell_type_curated", "prop")
+df$comm_anc_GI1 <- factor(df$comm_anc_GI,
+                         levels = c("lymphocyte of B lineage ",
+                                    "antibody secreting cell ",
+                                    "B cell, CD19-positive ",
+                                    "long lived plasma cell ",
+                                    "mature B cell ",
+                                    "immature B cell",
+                                    "IgA plasma cell", "IgM plasma cell",
+                                    "IgG plasma cell", "plasmablast",
+                                    "naive B cell",
+                                    "memory B cell ",
+                                    "class switched memory B cell",
+                                    "unswitched memory B cell"))
+
+df$cell_type_curated <- factor(
+  df$cell_type_curated,
+  levels = c(
+    "class switched memory B cell",
+    "unswitched memory B cell",
+    "naive B cell",
+    "immature B cell",
+    "plasmablast",
+    "IgM plasma cell",
+    "IgA plasma cell",
+    "IgG plasma cell"
+  )
+)
+
+library(stringr)
+p.bar <- ggplot(df, aes(x = cell_type_curated, y = prop, fill = comm_anc_GI1)) +
+  geom_bar(stat = "identity") +
+   scale_x_discrete(labels = function(x) str_wrap(x, width = 17)) +
+  scale_fill_manual(
+    values = node_colors,
+    name = "Predicted ancestor"
+  ) +
+  ylab("Predicted ancestor") +
+  xlab("True cell types") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+p.bar
+```
+```{r}
+# library(Polychrome)
+# n <- length(node_colors)
+# 
+# # Generate maximally distinct colors
+# distinct_colors <- createPalette(n, seedcolors = c("#7F7F7F"))
+# 
+# node_colors_new <- setNames(distinct_colors, names(node_colors))
+# ggplot(df, aes(x = cell_type_curated, y = prop, fill = comm_anc_GI)) +
+#   geom_bar(stat = "identity") +
+#   scale_fill_manual(
+#     values = node_colors_new,
+#     name = "Predicted ancestor"
+#   ) +
+#   ylab("Predicted ancestor") +
+#   xlab("True cell types") +
+#   theme_bw() +
+#   theme(
+#     axis.text.x = element_text(angle = 45, hjust = 1)
+#   )
+# 
+# nodeAttrs <- list(fillcolor = node_colors_new)
+# plot(pan.gr1,
+#      nodeAttrs = nodeAttrs,
+#      attrs = list(
+#        node = list(fontsize = 27, shape = "box", style = "filled",
+#                    fixedsize = FALSE)
+#      ))
+
+```
