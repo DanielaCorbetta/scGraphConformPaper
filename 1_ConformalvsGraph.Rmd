@@ -27,10 +27,12 @@ library(ontoProc)
 library(MerfishData)
 library(ExperimentHub)
 library(kableExtra)
-library(scConform)
+# library(scConform)
 library(BiocParallel)
 library(tidyr)
 library(ggplot2)
+library(ggdist)
+library(dplyr)
 `%notin%` = Negate(`%in%`)
 ```
 
@@ -191,9 +193,48 @@ sets_cf <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = FALSE,
 sets_graphs <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
                              resample = FALSE, return_sc = FALSE, onto = opi2,
                              labels = unique(df_cal$Y),
-                             BPPARAM = MulticoreParam(workers = 4))
+                             BPPARAM = MulticoreParam(workers = 4),
+                             method = "full")
 # Check coverage
 (cvg_graphs <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs)))
+
+# Graph-based (simple)
+sets_graphs_s <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 4),
+                             method = .predSetsSimple, lambdas = seq(0.001, 1, length.out = 100))
+
+# Check coverage
+(cvg_graphs_s <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs_s)))
+
+# Graph-based (steps from the pr class)
+sets_graphs_step <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 4),
+                             method = "step", lambdas = c(0:5))
+
+# Check coverage
+(cvg_graphs_step <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs_step)))
+lstep <- sapply(sets_graphs_step, length)
+l <- sapply(sets_graphs, length)
+
+# Rank leaves and cum prob
+sets_graphs_rank <- getPredictionSets(p_test, p_cal, df_cal$Y, follow_ontology = TRUE,
+                             resample = FALSE, return_sc = FALSE, onto = opi2,
+                             labels = unique(df_cal$Y),
+                             BPPARAM = MulticoreParam(workers = 4),
+                             method = "rank", lambdas = seq(0.001, 1, length.out = 100))
+
+# Check coverage
+(cvg_graphs_rank <- mean(mapply(function(vec, lst) vec %in% lst, df_test$Y, sets_graphs_rank)))
+lrank <- sapply(sets_graphs_rank, length)
+mean(lrank)
+mean(l)
+
+table(lrank)
+table(l)
 ```
 
 
@@ -268,8 +309,6 @@ sizes_gr
 
 
 ```{r}
-library(ggplot2)
-library(ggdist)
 # Combine data
 s_h_gr$method <- "Graphs"
 s_h_std$method <- "Split"
@@ -454,8 +493,6 @@ legend("topleft",
 ```
 
 ```{r}
-library(ggplot2)
-
 # Larger staggering since n_list = c(100,500,1000)
 offset_emp <- -20
 offset_crc <-   0
@@ -566,9 +603,6 @@ lines(density(n1000$cvg.crc), col="#6A3D9A")
 ```
 
 ```{r}
-library(ggplot2)
-library(dplyr)
-
 make_df <- function(vec, label) {
   data.frame(
     x = vec,
